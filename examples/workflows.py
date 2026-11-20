@@ -122,7 +122,89 @@ def run(flow):
                 swept = db.retention.sweep(100)
                 if db.get("segments", "timed") is not None or db.get("segments", "timed", written.revision) is None:
                     raise RuntimeError("expiry did not preserve historical visibility")
-                output = {"before": before.__dict__, "sweep": swept, "feed": db.feed.read(written.revision), "idle": db.retention.sweep(100)}
+
+                # Fair round-robin: a high-churn collection cannot monopolize small sweep quotas.
+                db.catalog.create("chatter")
+                db.catalog.create("quiet")
+                hot = db.batch()
+                for index in range(6):
+                    hot.put("chatter", f"hot_{index}", {"n": index}, expires_at=100)
+                cold = db.batch()
+                for index in range(3):
+                    cold.put("quiet", f"cold_{index}", {"n": index}, expires_at=100)
+                cold.commit()
+                hot.commit()
+                first_pass = db.retention.sweep(100, limit=2)
+                if {item["collection"] for item in first_pass["collections"]} != {"chatter", "quiet"}:
+                    raise RuntimeError("small sweep quota did not reach every due collection")
+                second_pass = db.retention.sweep(100, limit=2)
+                third_pass = db.retention.sweep(100, limit=2)
+                fourth_pass = db.retention.sweep(100, limit=2)
+                fairness = [pass_["next_turn"] for pass_ in (first_pass, second_pass, third_pass, fourth_pass)]
+                if any(pass_["expired"] == 0 for pass_ in (first_pass, second_pass, third_pass)):
+                    raise RuntimeError("round-robin sweep stopped making progress")
+                db.retention.sweep(100, limit=10000)
+
+                # A key renewed/rewritten after the scan is skipped, not misdeleted, and never
+                # blocks unrelated expired documents in the same sweep. A second handle is a
+                # genuine concurrent writer; the hook fires between the sweep snapshot and its
+                # writer transaction.
+                db.batch().put("chatter", "movable", {"n": 1}, expires_at=100).commit()
+                db.batch().put("chatter", "steady", {"n": 2}, expires_at=100).commit()
+                db.batch().put("quiet", "isolated", {"n": 3}, expires_at=100).commit()
+                writer = Database(db._store.path, timeout=5.0)
+
+                def renew_between_scan_and_commit(stamp, candidates):
+                    keys = {(item["collection"], item["key"]) for item in candidates}
+                    if ("chatter", "movable") in keys:
+                        # Same write path any caller uses: expected revision guards the renewal.
+                        writer.batch().put("chatter", "movable", {"n": 11},
+                                           expected=writer.get("chatter", "movable").revision,
+                                           expires_at=200).commit()
+
+                db.retention.after_scan_hook = renew_between_scan_and_commit
+                try:
+                    contested = db.retention.sweep(100, limit=3)
+                finally:
+                    del db.retention.after_scan_hook
+                    writer.close()
+                moved = db.get("chatter", "movable")
+                if moved is None or moved.expires_at != 200.0:
+                    raise RuntimeError("sweep misdeleted a document that was renewed after scanning")
+                if db.get("chatter", "steady") is not None or db.get("quiet", "isolated") is not None:
+                    raise RuntimeError("one stale key blocked unrelated expiry deletions")
+                if not contested["conflicts"] or contested["conflicts"][0]["reason"] != "renewed after scan":
+                    raise RuntimeError("conflict was not classified and reported")
+                # The renewal is a real commit; the sweep delete is a separate traceable commit.
+                contested_feed = db.feed.read(written.revision)
+
+                # Progress and failure reports are durable facts visible after reopening.
+                report_before_close = db.retention.sweep_report()
+                db.close()
+                with Database(db._store.path) as reopened:
+                    reopened_report = reopened.retention.sweep_report()
+                    if reopened_report != report_before_close:
+                        raise RuntimeError("sweep progress did not survive reopening")
+                    idle = reopened.retention.sweep(100)
+                    historical = reopened.get("segments", "timed", written.revision)
+                output = {"before": before.__dict__, "sweep": swept,
+                          "fairness_turns": fairness,
+                          "fairness_passes": [{"expired": p["expired"], "scanned": p["scanned"],
+                                               "turn": p["turn"], "next_turn": p["next_turn"],
+                                               "per_collection": [(c["collection"], c["deleted"]) for c in p["collections"]]}
+                                              for p in (first_pass, second_pass, third_pass, fourth_pass)],
+                          "contested": {"expired": contested["expired"], "revision": contested["revision"],
+                                        "remaining": contested["remaining"], "conflicts": contested["conflicts"]},
+                          "renewed_document": moved.__dict__,
+                          "feed_commits": [entry["revision"] for entry in contested_feed],
+                          "reopened_report": {"turn": reopened_report["turn"],
+                                              "failure_count": reopened_report["failure_count"],
+                                              "latest_failure": reopened_report["failures"][0],
+                                              "tracked_collections": [row["collection"] for row in reopened_report["collections"]]},
+                          "historical_after_reopen": historical.__dict__,
+                          "idle_after_reopen": idle}
+                with Database(db._store.path) as check:
+                    output["inspection"] = check.diagnostics.inspect(True)
             elif flow == "aggregate":
                 output = db.aggregates.group("segments", "region", "sequence", revision=first)
                 if sum(item["count"] for item in output["groups"]) != 6:

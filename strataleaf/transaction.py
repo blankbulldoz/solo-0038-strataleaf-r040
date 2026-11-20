@@ -14,6 +14,83 @@ class CommitResult:
     replayed: bool = False
 
 
+@dataclass(frozen=True)
+class SweepConflict:
+    collection: str
+    key: str
+    expected_rev: int
+    found_rev: int
+    reason: str
+
+
+def _conflict_reason(old, expected, now):
+    """Classify why a candidate revision no longer matches at sweep commit time."""
+    if old is None or old["body"] is None:
+        return "deleted after scan"
+    if old["rev"] != expected and old["expires"] is not None and old["expires"] > now:
+        return "renewed after scan"
+    return "rewritten after scan"
+
+
+def commit_operations(store, operations, *, request_key=None, tolerant=False, now=None):
+    """Commit one revision containing the accepted operations in a single atomic boundary.
+
+    Strict mode (regular batches) aborts the whole revision on the first failed precondition.
+    Tolerant mode (expiry sweep) instead skips stale candidates, reports them as conflicts, and
+    still commits every operation whose precondition still holds. No write is applied until every
+    precondition and schema has been re-checked inside the writer transaction, so partial effects
+    are impossible on abort. Returns (CommitResult|None, conflicts); the result is None in
+    tolerant mode when every candidate was stale.
+    """
+    if not operations or len(operations) > 10000:
+        raise InvalidDocument("batch must contain between 1 and 10000 operations")
+    fingerprint = digest(operations)
+    conflicts = []
+    with store.atomic(writable=True) as connection:
+        if request_key is not None:
+            prior = connection.execute("SELECT * FROM receipts WHERE request_key=?", (request_key,)).fetchone()
+            if prior:
+                if prior["request_hash"] != fingerprint:
+                    raise Conflict("request key was used with different operations")
+                return CommitResult(prior["rev"], prior["count"], True), []
+        head = int(store.get("head"))
+        accepted = []
+        for op in operations:
+            schema = connection.execute("SELECT schema FROM collections WHERE name=?", (op["collection"],)).fetchone()
+            if schema is None:
+                if tolerant:
+                    conflicts.append(SweepConflict(op["collection"], op["key"], op["expected"] or 0, 0,
+                                                   "collection removed after scan"))
+                    continue
+                raise NotFound("unknown collection: " + op["collection"])
+            old = latest_row(connection, op["collection"], op["key"], head)
+            current = old["rev"] if old is not None else 0
+            if op["expected"] is not None and op["expected"] != current:
+                if tolerant:
+                    conflicts.append(SweepConflict(op["collection"], op["key"], op["expected"], current,
+                                                   _conflict_reason(old, op["expected"], now)))
+                    continue
+                raise Conflict(f"revision conflict for {op['collection']}/{op['key']}: expected {op['expected']}, found {current}")
+            if op["document"] is not None:
+                validate_document(op["document"], loads(schema[0]))
+            accepted.append(op)
+        if not accepted:
+            return None, conflicts
+        revision = head + 1
+        for op in accepted:
+            body = dumps(op["document"]) if op["document"] is not None else None
+            connection.execute("INSERT INTO versions VALUES (?,?,?,?,?)",
+                               (op["collection"], op["key"], revision, body, op["expires_at"]))
+            refresh_document(connection, op["collection"], op["key"], op["document"])
+        payload = {"revision": revision, "operations": accepted}
+        connection.execute("INSERT INTO commits VALUES (?,?,?,?)",
+                           (revision, dumps(payload), request_key, fingerprint))
+        if request_key is not None:
+            connection.execute("INSERT INTO receipts VALUES (?,?,?,?)",
+                               (request_key, revision, fingerprint, len(accepted)))
+        store.set("head", revision)
+    return CommitResult(revision, len(accepted)), conflicts
+
 class WriteBatch:
     def __init__(self, store, request_key=None):
         self.store = store
@@ -58,41 +135,10 @@ class WriteBatch:
             raise Conflict("batch is already " + self.state)
         if not self.operations or len(self.operations) > 10000:
             raise InvalidDocument("batch must contain between 1 and 10000 operations")
-        fingerprint = digest(self.operations)
         try:
-            with self.store.atomic(writable=True) as connection:
-                if self.request_key is not None:
-                    prior = connection.execute("SELECT * FROM receipts WHERE request_key=?", (self.request_key,)).fetchone()
-                    if prior:
-                        if prior["request_hash"] != fingerprint:
-                            raise Conflict("request key was used with different operations")
-                        self.state = "committed"
-                        return CommitResult(prior["rev"], prior["count"], True)
-                head = int(self.store.get("head"))
-                for op in self.operations:
-                    schema = connection.execute("SELECT schema FROM collections WHERE name=?", (op["collection"],)).fetchone()
-                    if schema is None:
-                        raise NotFound("unknown collection: " + op["collection"])
-                    old = latest_row(connection, op["collection"], op["key"], head)
-                    current = old["rev"] if old is not None else 0
-                    if op["expected"] is not None and op["expected"] != current:
-                        raise Conflict(f"revision conflict for {op['collection']}/{op['key']}: expected {op['expected']}, found {current}")
-                    if op["document"] is not None:
-                        validate_document(op["document"], loads(schema[0]))
-                revision = head + 1
-                for op in self.operations:
-                    body = dumps(op["document"]) if op["document"] is not None else None
-                    connection.execute("INSERT INTO versions VALUES (?,?,?,?,?)",
-                                       (op["collection"], op["key"], revision, body, op["expires_at"]))
-                    refresh_document(connection, op["collection"], op["key"], op["document"])
-                payload = {"revision": revision, "operations": self.operations}
-                connection.execute("INSERT INTO commits VALUES (?,?,?,?)",
-                                   (revision, dumps(payload), self.request_key, fingerprint))
-                if self.request_key is not None:
-                    connection.execute("INSERT INTO receipts VALUES (?,?,?,?)", (self.request_key, revision, fingerprint, len(self.operations)))
-                self.store.set("head", revision)
+            result, _ = commit_operations(self.store, self.operations, request_key=self.request_key)
         except BaseException:
             self.state = "aborted"
             raise
         self.state = "committed"
-        return CommitResult(revision, len(self.operations))
+        return result

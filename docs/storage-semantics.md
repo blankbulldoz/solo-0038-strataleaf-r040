@@ -1,6 +1,8 @@
 # 数据与兼容边界
 
-物理表包括 meta、collections、versions、commits、receipts、index_defs、index_values、pins、consumers。versions 的主键为集合、键、修订；body 的 SQL NULL 表示删除，JSON null 只能作为文档字段。collections 保存当前模式；index_values 是当前 head 的投影。commits 保存完整的操作序列；receipts 保存不受历史回收影响的请求摘要与结果。幂等键不能被不同操作复用，回放不重新执行前置条件。
+物理表包括 meta、collections、versions、commits、receipts、index_defs、index_values、pins、consumers、sweep_progress、sweep_failures。versions 的主键为集合、键、修订；body 的 SQL NULL 表示删除，JSON null 只能作为文档字段。collections 保存当前模式；index_values 是当前 head 的投影。commits 保存完整的操作序列；receipts 保存不受历史回收影响的请求摘要与结果。幂等键不能被不同操作复用，回放不重新执行前置条件。
+
+sweep_progress 以集合为主键记录最后处理键与到期时间、累计扫描/删除/冲突计数和最后一次 sweep 时间；sweep_failures 自增记录每次被跳过的到期候选（观察时间、集合、键、预期与实际修订、原因），仅保留最近 100 条。meta 的 sweep_turn 保存下次轮转起点。这些表只由显式 sweep 写入，随在线备份一并复制；它们不参与版本可见性，时间经过本身依旧不改变任何读结果。
 
 floor 是仍可读取的最早修订，不代表每条物理版本的最小修订；每个键在 floor 之前的最后版本可能是构造 floor 读视图的基准，必须保留。commits 仅需保存大于 floor 的提交，消费者从自己的 ack 之后读取。pin 与消费者位置不能低于现存 floor。
 

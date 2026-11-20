@@ -12,7 +12,8 @@ class Diagnostics:
             integrity = [row[0] for row in connection.execute("PRAGMA integrity_check" if deep else "PRAGMA quick_check")]
             references = [tuple(row) for row in connection.execute("PRAGMA foreign_key_check")]
             counts = {table: connection.execute("SELECT COUNT(*) FROM " + table).fetchone()[0]
-                      for table in ("collections", "versions", "commits", "index_defs", "index_values", "pins", "consumers")}
+                      for table in ("collections", "versions", "commits", "index_defs", "index_values",
+                                    "pins", "consumers", "sweep_progress", "sweep_failures")}
             revisions = [row[0] for row in connection.execute("SELECT rev FROM commits WHERE rev>? ORDER BY rev", (floor,))]
             issues = []
             if revisions != list(range(floor + 1, head + 1)):

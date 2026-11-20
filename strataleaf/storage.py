@@ -24,6 +24,15 @@ CREATE TABLE IF NOT EXISTS index_values (
 CREATE INDEX IF NOT EXISTS index_document ON index_values(collection,key);
 CREATE TABLE IF NOT EXISTS pins (name TEXT PRIMARY KEY, rev INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS consumers (name TEXT PRIMARY KEY, ack INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS sweep_progress (
+ collection TEXT PRIMARY KEY, last_key TEXT NOT NULL, last_expires REAL,
+ scanned_total INTEGER NOT NULL, deleted_total INTEGER NOT NULL, conflict_total INTEGER NOT NULL,
+ last_sweep REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS sweep_failures (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, observed_at REAL NOT NULL,
+ collection TEXT NOT NULL, key TEXT NOT NULL, expected_rev INTEGER NOT NULL,
+ found_rev INTEGER NOT NULL, reason TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS sweep_failures_recent ON sweep_failures(id DESC);
 """
 
 
@@ -40,7 +49,8 @@ class Storage:
         self.connection.executescript(DDL)
         with self.atomic():
             initial = {"format": "1", "head": "0", "floor": "0", "database_id": str(uuid.uuid4()),
-                       "cursor_secret": secrets.token_hex(32), "mode": "primary", "upstream": "", "catalog_epoch": "0"}
+                       "cursor_secret": secrets.token_hex(32), "mode": "primary", "upstream": "",
+                       "catalog_epoch": "0", "sweep_turn": ""}
             for key, value in initial.items():
                 self.connection.execute("INSERT OR IGNORE INTO meta VALUES (?,?)", (key, value))
             if self.get("format") != "1":
